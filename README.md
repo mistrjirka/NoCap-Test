@@ -43,7 +43,7 @@ It uses stock PyTorch rather than a custom CUDA extension. This maximizes RTX
 ```bash
 uv venv --python 3.12
 source .venv/bin/activate
-uv pip install -r requirements.txt
+uv pip install -r requirements-architecture-lab.txt
 ```
 
 ### RTX 3090

@@ -1,0 +1,5 @@
+# Install a CUDA-enabled PyTorch build separately with the matching helper script.
+huggingface-hub>=0.30,<2
+numpy>=1.26,<3
+rich>=13,<20
+wandb>=0.19,<1
