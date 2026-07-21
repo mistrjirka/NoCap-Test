@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 python smoke_test.py
+python resume_test.py
 python inspect_env.py
 
 torchrun --standalone --nproc_per_node=1 train.py \
@@ -15,4 +16,5 @@ torchrun --standalone --nproc_per_node=1 train.py \
   --num_iterations 10 \
   --val_loss_every 5 \
   --no-stop_at_target \
-  --output_dir runs-smoke
+  --save_every 5 \
+  --output_dir runs-smoke "$@"

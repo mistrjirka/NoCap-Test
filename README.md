@@ -87,11 +87,14 @@ runs evaluate exactly 1,048,576 validation tokens.
 
 ```bash
 python smoke_test.py
+python resume_test.py
 bash scripts/run_smoke.sh
 ```
 
-The smoke test checks parameter counts, tied-weight initialization, finite
-forward/backward passes, strict convolution causality, and the TTY zoom logic.
+The tests check parameter counts, tied-weight initialization, finite
+forward/backward passes, strict convolution causality, TTY zoom logic, atomic
+checkpoint publication, data-stream continuity, RNG restoration, and AdamW
+continuation.
 
 ## Recommended experiment order
 
@@ -132,7 +135,53 @@ bash scripts/run_dense_v100.sh |& tee dense512-v100.log
 bash scripts/run_liquidlite_v100.sh |& tee liquidlite-v100.log
 ```
 
-Never resume checkpoints created before the tied-vocabulary initialization fix.
+## Exact resume support
+
+New runs atomically refresh `latest.pt` every 256 completed optimizer steps.
+Checkpoint writing and downtime are excluded from the accumulated benchmark
+training time. To resume LiquidLite on the RTX 3090, pass either the run
+directory or its checkpoint file:
+
+```bash
+bash scripts/run_liquidlite_3090.sh \
+  --resume runs/liquidlite512-<run-id>
+
+# Equivalent explicit path:
+bash scripts/run_liquidlite_3090.sh \
+  --resume runs/liquidlite512-<run-id>/latest.pt
+```
+
+The same works with the baseline, Dense512, probe, and V100 launchers because
+they forward extra arguments to `train.py`.
+
+A single `Ctrl+C` or `SIGTERM` asks the trainer to finish the current optimizer
+step and write an exact checkpoint. A second signal aborts immediately. Exact
+resume restores:
+
+- model, AdamW, and FP16 GradScaler state;
+- the next optimizer-step index and original learning-rate schedule;
+- training-shard position and the already-prefetched next batch;
+- Python, NumPy, CPU Torch, and CUDA RNG states;
+- cumulative measured training time and the original run directory/logs.
+
+Resume is intentionally strict. It rejects changes to the architecture, data
+patterns, batch shape, schedule, optimizer settings, validation settings, GPU,
+PyTorch version, dtype, or world size. It currently targets the challenge's
+one-GPU setup. Old checkpoints created before checkpoint format 2 cannot be
+resumed exactly because they lack loader, prefetch, scaler, and RNG state.
+
+Useful controls:
+
+```bash
+# Save more often (checkpoint I/O is excluded from benchmark training time):
+bash scripts/run_liquidlite_3090.sh --save_every 128
+
+# Disable periodic saves; final.pt is still written at a clean finish:
+bash scripts/run_liquidlite_3090.sh --save_every 0
+
+# Keep step-000256.pt, step-000512.pt, ... hard-linked snapshots:
+bash scripts/run_liquidlite_3090.sh --keep_step_checkpoints
+```
 
 ## Better terminal graphs
 

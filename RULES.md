@@ -16,3 +16,10 @@ from `events.jsonl`, along with the copied source and `metadata.json`.
 
 Do not use the validation shard for training, data selection, adaptive learning
 rate control, routing decisions, or architecture tuning.
+
+Exact resume is valid only from checkpoint format 2 on the same GPU, PyTorch
+build, dtype, model/data configuration, optimizer schedule, and one-process
+world size. The trainer restores loader position, prefetched input, GradScaler,
+RNG, and cumulative measured training time. Checkpoint I/O and machine downtime
+are not added to benchmark training time; all resume/checkpoint events remain in
+`events.jsonl` for auditability.
