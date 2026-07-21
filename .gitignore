@@ -1,4 +1,10 @@
+.venv/
+__pycache__/
+*.py[cod]
 data/fineweb10B/
-pylog124M/
-logs/
+runs/
+runs-smoke/
+runs-probe/
 wandb/
+*.log
+*.pt
