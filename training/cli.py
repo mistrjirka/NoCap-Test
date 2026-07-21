@@ -103,9 +103,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_iterations", type=int, default=4768)
 
     parser.add_argument("--learning_rate", type=float, default=0.0018)
+    parser.add_argument(
+        "--lr_schedule",
+        choices=("wsd", "loss-velocity-wsd"),
+        default="wsd",
+        help="Fixed WSD or an AdaLRS-inspired training-loss velocity overlay",
+    )
     parser.add_argument("--warmup_iters", type=int, default=256)
     parser.add_argument("--warmdown_iters", type=int, default=1024)
     parser.add_argument("--weight_decay", type=float, default=0.1)
+    parser.add_argument("--lr_search_start", type=int, default=None)
+    parser.add_argument("--lr_search_end", type=int, default=None)
+    parser.add_argument("--lr_velocity_window", type=int, default=128)
+    parser.add_argument("--lr_upscale_factor", type=float, default=1.08)
+    parser.add_argument("--lr_downscale_factor", type=float, default=1.05)
+    parser.add_argument("--lr_factor_decay", type=float, default=0.90)
+    parser.add_argument("--lr_velocity_trigger", type=float, default=0.12)
+    parser.add_argument("--lr_velocity_accept", type=float, default=0.03)
+    parser.add_argument("--lr_velocity_ema_beta", type=float, default=0.80)
+    parser.add_argument("--lr_loss_rise_guard", type=float, default=0.06)
+    parser.add_argument("--lr_min_peak", type=float, default=None)
+    parser.add_argument("--lr_max_peak", type=float, default=None)
 
     parser.add_argument("--val_loss_every", type=int, default=128)
     parser.add_argument("--val_batch_size", type=int, default=16)
@@ -148,5 +166,17 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Sequence length and iterations must be positive")
     if args.validation_tokens <= 0:
         raise ValueError("validation_tokens must be positive")
+    if args.learning_rate <= 0:
+        raise ValueError("learning_rate must be positive")
+    if args.warmup_iters < 0 or args.warmdown_iters < 0:
+        raise ValueError("warmup and warmdown cannot be negative")
+    if args.warmup_iters + args.warmdown_iters > args.num_iterations:
+        raise ValueError("warmup + warmdown exceeds the training horizon")
     if args.save_every < 0:
         raise ValueError("save_every cannot be negative")
+    if args.lr_search_start is not None and args.lr_search_start < 0:
+        raise ValueError("lr_search_start cannot be negative")
+    if args.lr_search_end is not None and args.lr_search_end < 0:
+        raise ValueError("lr_search_end cannot be negative")
+    if args.lr_velocity_window < 8:
+        raise ValueError("lr_velocity_window must be at least 8")
