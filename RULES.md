@@ -23,3 +23,10 @@ world size. The trainer restores loader position, prefetched input, GradScaler,
 RNG, and cumulative measured training time. Checkpoint I/O and machine downtime
 are not added to benchmark training time; all resume/checkpoint events remain in
 `events.jsonl` for auditability.
+
+Adaptive LR experiments may use training loss only. The official validation
+shard remains evaluation-only and must not trigger LR changes. Scheduler
+configuration and decisions are written to `events.jsonl`; adaptive state is
+reconstructed from the audited per-step training-loss log during exact resume.
+When evaluating architectural speedups, report whether the baseline received the
+same scheduler and cooldown opportunity.
