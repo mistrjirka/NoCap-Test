@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
+from training.display import ResumableProgressDisplay
 from training.lr_scheduler import (
     LossVelocityWSD,
     build_lr_scheduler,
@@ -169,11 +170,37 @@ def test_log_replay_and_legacy_resume_args() -> None:
     print("loss-log replay and legacy WSD resume compatibility OK")
 
 
+def test_tui_scheduler_row() -> None:
+    display = object.__new__(ResumableProgressDisplay)
+    display._scheduler_status = {
+        "name": "loss-velocity-wsd",
+        "phase": "lr-search",
+        "peak_lr": 0.0018,
+        "window_progress": 17,
+        "window_steps": 128,
+        "velocity": 1.2e-4,
+        "velocity_ema": 1.4e-4,
+        "decisions": 2,
+        "accepted_trials": 1,
+        "rejected_trials": 1,
+        "last_event": "accepted higher LR",
+    }
+    display._warmup_iters = 256
+    display._warmdown_iters = 512
+    display._total_steps = 4_768
+    row = display._lr_row(1_000, 0.0018).plain
+    assert "loss-velocity-wsd" in row
+    assert "window 17/128" in row
+    assert "accepted higher LR" in row
+    print("TUI scheduler status row OK")
+
+
 def main() -> None:
     test_fixed_wsd_parity()
     test_robust_velocity()
     test_adaptive_trial_accept_and_reject()
     test_log_replay_and_legacy_resume_args()
+    test_tui_scheduler_row()
 
 
 if __name__ == "__main__":
