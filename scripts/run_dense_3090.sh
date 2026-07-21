@@ -15,4 +15,4 @@ exec torchrun --standalone --nproc_per_node=1 train.py \
   --val_loss_every 128 \
   --target_val_loss 3.3821 \
   --stop_at_target \
-  --output_dir runs
+  --output_dir runs "$@"

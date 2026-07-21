@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 preset="${1:-liquidlite512}"
-steps="${2:-1024}"
+if (( $# > 0 )); then shift; fi
+steps="${1:-1024}"
+if (( $# > 0 )); then shift; fi
 exec torchrun --standalone --nproc_per_node=1 train.py \
   --preset "$preset" \
   --amp bf16 \
@@ -16,4 +18,4 @@ exec torchrun --standalone --nproc_per_node=1 train.py \
   --weight_decay 0.1 \
   --val_loss_every 128 \
   --no-stop_at_target \
-  --output_dir runs-probe
+  --output_dir runs-probe "$@"
