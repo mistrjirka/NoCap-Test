@@ -13,13 +13,16 @@ def main() -> None:
     args = build_parser().parse_args()
     validate_args(args)
     runtime = build_runtime(args)
-    attach_lr_scheduler(runtime)
     caught: BaseException | None = None
+    scheduler_attached = False
     try:
+        attach_lr_scheduler(runtime)
+        scheduler_attached = True
         run_training(runtime)
     except BaseException as exc:
         caught = exc
-        checkpoint_after_exception(runtime)
+        if scheduler_attached:
+            checkpoint_after_exception(runtime)
         raise
     finally:
         finalize_runtime(runtime, caught)
