@@ -1,0 +1,6 @@
+run_loss_velocity_probe_3090.sh
+run_loss_velocity_probe_v100.sh
+run_loss_velocity_same_decay_3090.sh
+run_loss_velocity_same_decay_v100.sh
+run_loss_velocity_3090.sh
+run_loss_velocity_v100.sh
