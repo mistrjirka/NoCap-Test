@@ -2,6 +2,7 @@
 set -euo pipefail
 python smoke_test.py
 python resume_test.py
+python scheduler_test.py
 python inspect_env.py
 
 torchrun --standalone --nproc_per_node=1 train.py \
