@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 from training.cli import build_parser, validate_args
+from training.finalize import checkpoint_after_exception, finalize_runtime
 from training.loop import run_training
-from training.runtime import (
-    build_runtime,
-    checkpoint_after_exception,
-    finalize_runtime,
-)
+from training.setup import build_runtime
 
 
 def main() -> None:
