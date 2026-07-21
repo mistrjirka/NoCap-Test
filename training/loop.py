@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -17,6 +19,9 @@ def reduce_mean(value: torch.Tensor, distributed: bool) -> torch.Tensor:
 
 
 def learning_rate_at(runtime: Runtime, step: int) -> float:
+    scheduler = getattr(runtime, "lr_scheduler", None)
+    if scheduler is not None:
+        return float(scheduler.lr_for_step(step))
     args = runtime.args
     if args.warmup_iters > 0 and step < args.warmup_iters:
         return args.learning_rate * (step + 1) / args.warmup_iters
@@ -36,6 +41,19 @@ def print_startup(runtime: Runtime) -> None:
     print0(f"GPU: {torch.cuda.get_device_name(runtime.device)}; AMP: {runtime.amp_name}")
     print0(f"Preset: {runtime.args.preset}; parameters: {runtime.parameter_count:,}")
     print0(f"Mixer stack: {runtime.mixer_summary}")
+    scheduler = getattr(runtime, "lr_scheduler", None)
+    if scheduler is not None:
+        config = scheduler.config_dict()
+        print0(
+            f"LR controller: {config['schedule']}; initial peak "
+            f"{config['initial_peak_lr']:.6f}; warmdown {config['warmdown_steps']} steps"
+        )
+        if config["schedule"] == "loss-velocity-wsd":
+            print0(
+                f"LR search: steps {config['search_start']}..{config['search_end'] - 1}; "
+                f"window {config['window_steps']}; bounds "
+                f"{config['min_peak_lr']:.6f}..{config['max_peak_lr']:.6f}"
+            )
     if runtime.checkpoint is not None:
         print0(
             f"Resuming at optimizer step {runtime.start_step}; measured training "
@@ -63,12 +81,26 @@ def switch_context_if_needed(runtime: Runtime, step: int) -> None:
         raise ValueError(
             f"Sequence length {scheduled_t} does not divide microbatch token counts"
         )
+    old_t = runtime.current_t
     runtime.current_t = scheduled_t
     train_b = runtime.microbatch_tokens // scheduled_t
     val_b = runtime.val_microbatch_tokens // scheduled_t
     runtime.train_loader.set_batch_shape(train_b, scheduled_t)
     runtime.val_loader.set_batch_shape(val_b, scheduled_t)
     runtime.x, runtime.y = runtime.train_loader.next_batch()
+    scheduler = getattr(runtime, "lr_scheduler", None)
+    if scheduler is not None:
+        scheduler.reset_observations(cancel_trial=True)
+        runtime.display.set_scheduler_status(scheduler.status(step))
+    json_log(
+        runtime.log_path,
+        {
+            "event": "context_switch",
+            "step": step,
+            "old_sequence_length": old_t,
+            "sequence_length": scheduled_t,
+        },
+    )
     runtime.safe_boundary = True
     runtime.safe_next_step = step
     print0(f"step {step}: switched to B={train_b}, T={scheduled_t}")
@@ -158,6 +190,33 @@ def validate(runtime: Runtime, step: int, last_step: bool) -> bool:
     return True
 
 
+def _log_scheduler_events(runtime: Runtime, events: list[object], step: int) -> None:
+    if not events:
+        return
+    for scheduler_event in events:
+        payload = scheduler_event.to_dict()
+        json_log(
+            runtime.log_path,
+            {
+                "event": "lr_scheduler",
+                "effective_step": step + 1,
+                **payload,
+            },
+        )
+        print0(
+            f"LR scheduler: {payload['kind']} at step {step}; peak "
+            f"{payload['old_peak_lr']:.6f} -> {payload['new_peak_lr']:.6f}"
+        )
+        if runtime.wandb is not None:
+            runtime.wandb.log(
+                {
+                    "lr_peak": payload["new_peak_lr"],
+                    "lr_scheduler_decision": payload["kind"],
+                },
+                step=(step + 1) * runtime.tokens_per_iteration,
+            )
+
+
 def train_one_step(runtime: Runtime, step: int) -> None:
     runtime.model.train()
     runtime.safe_boundary = False
@@ -186,21 +245,39 @@ def train_one_step(runtime: Runtime, step: int) -> None:
     runtime.safe_boundary = True
     runtime.safe_next_step = step + 1
 
-    measured_ms = runtime.measured_time_ms()
     reduce_mean(train_loss, runtime.distributed)
     loss_value = float(train_loss.item())
+    if not math.isfinite(loss_value):
+        raise FloatingPointError(f"Non-finite training loss at step {step}")
+    scheduler = getattr(runtime, "lr_scheduler", None)
+    scheduler_events: list[object] = []
+    scheduler_status: dict[str, object] | None = None
+    if scheduler is not None:
+        scheduler_events = scheduler.observe(step, loss_value)
+        scheduler_status = scheduler.status(step + 1)
+        runtime.display.set_scheduler_status(scheduler_status)
+    measured_ms = runtime.measured_time_ms()
+
     runtime.display.update_train(step, loss_value, lr)
-    json_log(
-        runtime.log_path,
-        {
-            "event": "train",
-            "step": step,
-            "train_loss": loss_value,
-            "learning_rate": lr,
-            "train_time_s": measured_ms / 1000.0,
-            "sequence_length": runtime.current_t,
-        },
-    )
+    train_event: dict[str, object] = {
+        "event": "train",
+        "step": step,
+        "train_loss": loss_value,
+        "learning_rate": lr,
+        "train_time_s": measured_ms / 1000.0,
+        "sequence_length": runtime.current_t,
+    }
+    if scheduler_status is not None:
+        train_event.update(
+            {
+                "lr_schedule": scheduler_status["name"],
+                "lr_phase": scheduler_status["phase"],
+                "peak_learning_rate": scheduler_status["peak_lr"],
+                "loss_velocity": scheduler_status["velocity"],
+            }
+        )
+    json_log(runtime.log_path, train_event)
+    _log_scheduler_events(runtime, scheduler_events, step)
 
 
 def run_training(runtime: Runtime) -> None:
