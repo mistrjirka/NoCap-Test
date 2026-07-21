@@ -88,6 +88,7 @@ runs evaluate exactly 1,048,576 validation tokens.
 ```bash
 python smoke_test.py
 python resume_test.py
+python scheduler_test.py
 bash scripts/run_smoke.sh
 ```
 
@@ -134,6 +135,50 @@ bash scripts/run_baseline_v100.sh |& tee baseline-v100.log
 bash scripts/run_dense_v100.sh |& tee dense512-v100.log
 bash scripts/run_liquidlite_v100.sh |& tee liquidlite-v100.log
 ```
+
+## Loss-velocity WSD experiment
+
+The default remains the original fixed Warmup–Stable–Decay schedule. An optional
+`loss-velocity-wsd` controller searches for a better **peak** learning rate from
+training-loss dynamics during the early stable phase, then freezes that peak and
+uses an ordinary terminal linear warmdown.
+
+The implementation is conservative and AdaLRS-inspired rather than a claim of
+exact paper reproduction: it uses robust least-squares slopes of smoothed log
+training loss, mild trial multipliers, shrinking adjustment sizes, bounded LR
+search, and no validation-set feedback. It deliberately avoids model-state
+backtracking because hidden snapshot/restore costs and repeated-token accounting
+would complicate a fair speedrun.
+
+Recommended RTX 3090 probe:
+
+```bash
+bash scripts/run_loss_velocity_probe_3090.sh dense512 1536 \
+  |& tee dense512-loss-velocity-probe.log
+```
+
+Recommended full candidate:
+
+```bash
+bash scripts/run_loss_velocity_3090.sh dense512 \
+  |& tee dense512-loss-velocity-3090.log
+
+# The same controller can be tested on the hybrid:
+bash scripts/run_loss_velocity_3090.sh liquidlite512 \
+  |& tee liquidlite-loss-velocity-3090.log
+```
+
+For a controlled scheduler-only ablation against the existing 1,024-step
+warmdown, override the candidate's shorter cooldown:
+
+```bash
+bash scripts/run_loss_velocity_3090.sh dense512 \
+  --warmdown_iters 1024 --lr_search_end 2808
+```
+
+Run the same controller on `baseline` before attributing an advantage solely to
+the architecture. See `SCHEDULER.md` for the algorithm, TUI fields, resume
+semantics, and experiment order.
 
 ## Exact resume support
 
@@ -193,6 +238,8 @@ The TTY now uses explicitly labelled adaptive ranges:
 - Large early spikes are clipped to robust percentiles instead of flattening the
   useful low-loss region.
 - Every graph prints its exact zoom range, so the display does not hide scaling.
+- The LR panel shows controller phase, selected peak LR, loss-velocity window,
+  robust velocity/EMA, accepted/rejected trials, and the latest LR decision.
 
 Raw values remain unchanged in `events.jsonl` and `console.log`.
 
