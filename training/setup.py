@@ -19,6 +19,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from data_loader import DistributedDataLoader, assert_disjoint_patterns
 from model import GPT, config_from_preset
+from moe_model import MOE_PRESETS, MoEGPT, config_from_moe_preset
 from resume_utils import (
     CHECKPOINT_FORMAT_VERSION,
     load_display_history,
@@ -77,7 +78,10 @@ def build_runtime(args: argparse.Namespace) -> Runtime:
             for item in args.conv_layers.split(",")
             if item.strip()
         )
-    config = config_from_preset(
+    config_builder = (
+        config_from_moe_preset if args.preset in MOE_PRESETS else config_from_preset
+    )
+    config = config_builder(
         args.preset,
         embedding_dim=args.embedding_dim,
         n_kv_head=args.n_kv_head,
@@ -118,7 +122,8 @@ def build_runtime(args: argparse.Namespace) -> Runtime:
         device,
     )
 
-    base_model = GPT(config).train().to(device)
+    model_class = MoEGPT if args.preset in MOE_PRESETS else GPT
+    base_model = model_class(config).train().to(device)
     parameter_count = base_model.parameter_count()
     init_std = base_model.tied_weight_std()
     expected_std = base_model.expected_tied_weight_std()
@@ -232,6 +237,8 @@ def build_runtime(args: argparse.Namespace) -> Runtime:
         sources = (
             "train.py",
             "model.py",
+            "moe.py",
+            "moe_model.py",
             "data_loader.py",
             "progress.py",
             "resume_utils.py",

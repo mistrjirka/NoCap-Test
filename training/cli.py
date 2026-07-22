@@ -65,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
             "dense512-gated",
             "liquidlite512",
             "liquidlite512-gqa4",
+            "liquidlite512-moe",
             "liquidlite512-gelu",
         ),
         default="dense512",
@@ -97,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--conv_kernel_size", type=int, default=None)
+
 
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--grad_accumulation_steps", type=int, default=32)
