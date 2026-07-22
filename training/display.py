@@ -58,23 +58,23 @@ class ResumableProgressDisplay(ProgressDisplay):
             return super()._lr_row(step, lr)
 
         phase = str(status.get("phase", "stable"))
-        if phase == "warmup":
-            pct = (step + 1) / max(self._warmup_iters, 1)
-            phase_style = "yellow"
-        elif phase == "warmdown":
-            steps_in = step - (self._total_steps - self._warmdown_iters)
-            pct = 1.0 - steps_in / max(self._warmdown_iters, 1)
-            phase_style = "red"
-        elif phase == "lr-trial":
-            pct = 1.0
-            phase_style = "bold yellow"
-        elif phase == "lr-search":
-            pct = 1.0
-            phase_style = "bold cyan"
-        else:
-            pct = 1.0
-            phase_style = "green"
-        pct = max(0.0, min(1.0, pct))
+        name = str(status.get("name", "wsd"))
+        peak = float(status.get("peak_lr", lr))
+        base_lr = float(status.get("base_lr", lr))
+        multiplier = float(status.get("lr_multiplier", 1.0))
+        phase_styles = {
+            "warmup": "yellow",
+            "lr-search": "bold cyan",
+            "lr-trial": "bold yellow",
+            "sqrt-decay": "cyan",
+            "loss-monitor": "bold cyan",
+            "loss-cooldown": "yellow",
+            "stable": "green",
+            "warmdown": "red",
+        }
+        phase_style = phase_styles.get(phase, "white")
+        scale = max(peak, 1e-12)
+        pct = max(0.0, min(1.0, lr / scale))
 
         bar_w = 30
         filled = int(pct * bar_w)
@@ -86,13 +86,43 @@ class ResumableProgressDisplay(ProgressDisplay):
         text.append(phase, style=phase_style)
         text.append("]")
 
-        name = str(status.get("name", "wsd"))
-        peak = float(status.get("peak_lr", lr))
         text.append("\nLR controller  ", style="bright_black")
-        text.append(name, style="bold cyan" if name != "wsd" else "white")
+        text.append(
+            name,
+            style=(
+                "bold cyan"
+                if name in {"loss-velocity-wsd", "loss-aware-wsqd"}
+                else "white"
+            ),
+        )
         text.append(f"  peak {peak:.6f}", style="white")
 
-        if name == "loss-velocity-wsd":
+        if name in {"wsqd", "loss-aware-wsqd"}:
+            text.append(f"  base {base_lr:.6f}", style="bright_black")
+        if name == "loss-aware-wsqd":
+            progress = int(status.get("window_progress", 0))
+            window = int(status.get("window_steps", 0))
+            decisions = int(status.get("downward_adjustments", 0))
+            streak = int(status.get("plateau_streak", 0))
+            patience = int(status.get("plateau_patience", 0))
+            improvement = status.get("window_improvement")
+            velocity = status.get("velocity")
+            text.append(
+                f"  ×{multiplier:.3f}",
+                style="bold yellow" if multiplier < 1 else "white",
+            )
+            text.append(f"  window {progress}/{window}", style="bright_black")
+            if improvement is not None:
+                improvement_value = float(improvement)
+                improvement_style = "green" if improvement_value > 0 else "red"
+                text.append(f"  Δmed={improvement_value:+.2%}", style=improvement_style)
+            if velocity is not None:
+                text.append(f"  v={float(velocity):.2e}", style="white")
+            text.append(
+                f"\nplateau  streak {streak}/{patience}  downward decisions {decisions}",
+                style="bright_black",
+            )
+        elif name == "loss-velocity-wsd":
             progress = int(status.get("window_progress", 0))
             window = int(status.get("window_steps", 0))
             decisions = int(status.get("decisions", 0))
@@ -109,7 +139,8 @@ class ResumableProgressDisplay(ProgressDisplay):
                 f"  decisions {decisions} ({accepted}✓/{rejected}×)",
                 style="bright_black",
             )
-            last_event = str(status.get("last_event", ""))
-            if last_event:
-                text.append(f"\nlast LR event  {last_event}", style="bright_black")
+
+        last_event = str(status.get("last_event", ""))
+        if last_event:
+            text.append(f"\nlast LR event  {last_event}", style="bright_black")
         return text

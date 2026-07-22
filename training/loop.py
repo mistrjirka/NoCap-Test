@@ -54,6 +54,19 @@ def print_startup(runtime: Runtime) -> None:
                 f"window {config['window_steps']}; bounds "
                 f"{config['min_peak_lr']:.6f}..{config['max_peak_lr']:.6f}"
             )
+        elif config["schedule"] in {"wsqd", "loss-aware-wsqd"}:
+            print0(
+                f"WSqD base: shift {config['wsqd_shift_steps']:.0f} steps; "
+                f"monotonic square-root decay; final linear cooldown"
+            )
+            if config["schedule"] == "loss-aware-wsqd":
+                print0(
+                    f"Loss monitor: steps {config['search_start']}.."
+                    f"{config['search_end'] - 1}; window {config['window_steps']}; "
+                    f"plateau <{config['plateau_min_improvement']:.2%} for "
+                    f"{config['plateau_patience']} windows; LR ×"
+                    f"{config['plateau_drop_factor']:.3f}"
+                )
     if runtime.checkpoint is not None:
         print0(
             f"Resuming at optimizer step {runtime.start_step}; measured training "
@@ -204,7 +217,7 @@ def _log_scheduler_events(runtime: Runtime, events: list[object], step: int) -> 
             },
         )
         print0(
-            f"LR scheduler: {payload['kind']} at step {step}; peak "
+            f"LR scheduler: {payload['kind']} at step {step}; setting "
             f"{payload['old_peak_lr']:.6f} -> {payload['new_peak_lr']:.6f}"
         )
         if runtime.wandb is not None:
@@ -273,7 +286,10 @@ def train_one_step(runtime: Runtime, step: int) -> None:
                 "lr_schedule": scheduler_status["name"],
                 "lr_phase": scheduler_status["phase"],
                 "peak_learning_rate": scheduler_status["peak_lr"],
+                "base_learning_rate": scheduler_status["base_lr"],
+                "lr_multiplier": scheduler_status["lr_multiplier"],
                 "loss_velocity": scheduler_status["velocity"],
+                "loss_window_improvement": scheduler_status["window_improvement"],
             }
         )
     json_log(runtime.log_path, train_event)

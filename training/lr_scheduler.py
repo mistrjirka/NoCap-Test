@@ -1,8 +1,20 @@
-"""Fixed WSD and a conservative training-loss-velocity WSD controller.
+"""Learning-rate schedules for NoCap pretraining.
 
-The adaptive mode is inspired by AdaLRS, but is intentionally not an exact
-reproduction: it avoids model/optimizer backtracking so speedrun overhead and
-token accounting remain explicit.
+Supported controllers:
+
+* ``wsd``: the original fixed Warmup–Stable–Decay schedule.
+* ``loss-velocity-wsd``: the earlier AdaLRS-inspired peak-LR search. It is kept
+  for reproducibility, but its forward-only up-trials are experimental.
+* ``wsqd``: a paper-inspired shifted inverse-square-root base with a final
+  linear cooldown.
+* ``loss-aware-wsqd``: WSqD plus conservative, downward-only loss-triggered
+  multiplier reductions.
+
+The loss-aware controller never raises the learning rate after warmup. This is
+intentional: AdaLRS relies on trial-state backtracking, and its own ablation
+reports that removing backtracking can leave persistent damage after an
+oversized LR trial. Model/optimizer backtracking is undesirable in a timed
+speedrun, so the safer adaptation is monotonic.
 """
 
 from __future__ import annotations
@@ -13,7 +25,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-ScheduleName = Literal["wsd", "loss-velocity-wsd"]
+ScheduleName = Literal[
+    "wsd",
+    "loss-velocity-wsd",
+    "wsqd",
+    "loss-aware-wsqd",
+]
 
 
 @dataclass(frozen=True)
@@ -31,6 +48,8 @@ class SchedulerEvent:
 
 
 class LossVelocityWSD:
+    """Backwards-compatible controller implementing all supported schedules."""
+
     def __init__(
         self,
         *,
@@ -51,6 +70,12 @@ class LossVelocityWSD:
         rise_ratio: float,
         min_peak_lr: float,
         max_peak_lr: float,
+        wsqd_shift_steps: float = 512.0,
+        plateau_min_improvement: float = 0.02,
+        plateau_drop_factor: float = 0.80,
+        plateau_patience: int = 2,
+        plateau_cooldown_windows: int = 1,
+        plateau_min_multiplier: float = 0.25,
     ) -> None:
         self.schedule = schedule
         self.initial_peak_lr = initial_peak_lr
@@ -69,8 +94,16 @@ class LossVelocityWSD:
         self.rise_ratio = rise_ratio
         self.min_peak_lr = min_peak_lr
         self.max_peak_lr = max_peak_lr
+
+        self.wsqd_shift_steps = float(wsqd_shift_steps)
+        self.plateau_min_improvement = plateau_min_improvement
+        self.plateau_drop_factor = plateau_drop_factor
+        self.plateau_patience = plateau_patience
+        self.plateau_cooldown_windows = plateau_cooldown_windows
+        self.plateau_min_multiplier = plateau_min_multiplier
         self._validate()
 
+        # Existing loss-velocity WSD state.
         self.peak_lr = initial_peak_lr
         self.mode = "monitor"
         self.window_losses: list[float] = []
@@ -89,18 +122,30 @@ class LossVelocityWSD:
         self.rejected_trials = 0
         self.last_event = ""
 
+        # Downward-only loss-aware WSqD state.
+        self.lr_multiplier = 1.0
+        self.plateau_streak = 0
+        self.plateau_cooldown_remaining = 0
+        self.last_window_improvement: float | None = None
+        self.downward_adjustments = 0
+
     def _validate(self) -> None:
         stable_end = self.total_steps - self.warmdown_steps
-        if self.schedule not in {"wsd", "loss-velocity-wsd"}:
+        if self.schedule not in {
+            "wsd",
+            "loss-velocity-wsd",
+            "wsqd",
+            "loss-aware-wsqd",
+        }:
             raise ValueError(f"Unsupported LR schedule: {self.schedule}")
         if self.initial_peak_lr <= 0 or self.total_steps <= 0:
             raise ValueError("Peak LR and total steps must be positive")
         if not 0 <= self.warmup_steps <= stable_end:
             raise ValueError("Warmup overlaps terminal warmdown")
         if not self.warmup_steps <= self.search_start <= self.search_end <= stable_end:
-            raise ValueError("LR search must lie between warmup and warmdown")
+            raise ValueError("LR observation interval must lie between warmup and warmdown")
         if self.window_steps < 8:
-            raise ValueError("Loss-velocity window must contain at least 8 steps")
+            raise ValueError("Loss window must contain at least 8 steps")
         if self.upscale_factor <= 1 or self.downscale_factor <= 1:
             raise ValueError("LR scale factors must exceed 1")
         if not 0 < self.factor_decay <= 1:
@@ -111,10 +156,26 @@ class LossVelocityWSD:
             raise ValueError("Invalid EMA or loss-rise guard")
         if not 0 < self.min_peak_lr <= self.initial_peak_lr <= self.max_peak_lr:
             raise ValueError("Peak-LR bounds must contain the initial peak")
+        if self.wsqd_shift_steps < 0:
+            raise ValueError("WSqD shift must be non-negative")
+        if self.plateau_min_improvement < 0:
+            raise ValueError("Plateau minimum improvement cannot be negative")
+        if not 0 < self.plateau_drop_factor < 1:
+            raise ValueError("Plateau drop factor must be in (0, 1)")
+        if self.plateau_patience < 1:
+            raise ValueError("Plateau patience must be at least 1 window")
+        if self.plateau_cooldown_windows < 0:
+            raise ValueError("Plateau cooldown cannot be negative")
+        if not 0 < self.plateau_min_multiplier <= 1:
+            raise ValueError("Minimum LR multiplier must be in (0, 1]")
 
     @property
     def stable_end(self) -> int:
         return self.total_steps - self.warmdown_steps
+
+    @property
+    def uses_wsqd_base(self) -> bool:
+        return self.schedule in {"wsqd", "loss-aware-wsqd"}
 
     def phase_at(self, step: int) -> str:
         if self.warmup_steps and step < self.warmup_steps:
@@ -123,11 +184,40 @@ class LossVelocityWSD:
             return "warmdown"
         if self.schedule == "loss-velocity-wsd" and self.search_start <= step < self.search_end:
             return "lr-trial" if self.mode == "trial" else "lr-search"
+        if self.schedule == "loss-aware-wsqd" and self.search_start <= step < self.search_end:
+            if self.plateau_cooldown_remaining:
+                return "loss-cooldown"
+            return "loss-monitor"
+        if self.uses_wsqd_base:
+            return "sqrt-decay"
         return "stable"
+
+    def _wsqd_base_lr(self, step: int) -> float:
+        """Shifted inverse-square-root LR, normalized to peak after warmup."""
+        post_warmup_step = max(1, step - self.warmup_steps + 1)
+        numerator = self.wsqd_shift_steps + 1.0
+        denominator = self.wsqd_shift_steps + float(post_warmup_step)
+        return self.initial_peak_lr * math.sqrt(numerator / denominator)
+
+    def base_lr_for_step(self, step: int) -> float:
+        if self.warmup_steps and step < self.warmup_steps:
+            return self.initial_peak_lr * (step + 1) / self.warmup_steps
+        if not self.uses_wsqd_base:
+            return self.peak_lr
+
+        if self.warmdown_steps and step >= self.stable_end:
+            anchor = self._wsqd_base_lr(self.stable_end)
+            return anchor * max(0, self.total_steps - step) / self.warmdown_steps
+        return self._wsqd_base_lr(step)
 
     def lr_for_step(self, step: int) -> float:
         if self.warmup_steps and step < self.warmup_steps:
-            return self.peak_lr * (step + 1) / self.warmup_steps
+            return self.initial_peak_lr * (step + 1) / self.warmup_steps
+
+        if self.uses_wsqd_base:
+            multiplier = self.lr_multiplier if self.schedule == "loss-aware-wsqd" else 1.0
+            return self.base_lr_for_step(step) * multiplier
+
         if self.warmdown_steps and step >= self.stable_end:
             return self.peak_lr * max(0, self.total_steps - step) / self.warmdown_steps
         return self.peak_lr
@@ -157,9 +247,9 @@ class LossVelocityWSD:
     @staticmethod
     def representative_loss(losses: list[float]) -> float:
         clean = sorted(float(x) for x in losses if math.isfinite(x))
-        middle = len(clean) // 2
         if not clean:
             return float("nan")
+        middle = len(clean) // 2
         return clean[middle] if len(clean) % 2 else (clean[middle - 1] + clean[middle]) / 2
 
     def _set_peak(self, value: float) -> float:
@@ -175,6 +265,9 @@ class LossVelocityWSD:
         self.velocity_ema = self.last_velocity = self.last_window_loss = None
         self.consecutive_rising_windows = 0
         self.cooldown_windows = 1
+        self.plateau_streak = 0
+        self.plateau_cooldown_remaining = 1
+        self.last_window_improvement = None
         if cancel_trial and self.mode == "trial":
             self._set_peak(self.trial_origin_lr or self.peak_lr)
             self.mode = "monitor"
@@ -255,14 +348,103 @@ class LossVelocityWSD:
         self.reference_velocity = self.reference_loss = self.trial_origin_lr = None
         return [event]
 
+    def _observe_loss_aware_wsqd(
+        self,
+        step: int,
+        velocity: float,
+        median_loss: float,
+    ) -> list[SchedulerEvent]:
+        previous_loss = self.last_window_loss
+        previous_ema = self.velocity_ema
+        improvement: float | None = None
+        if previous_loss is not None and previous_loss > 0:
+            improvement = (previous_loss - median_loss) / previous_loss
+
+        self.last_window_improvement = improvement
+        self.last_velocity = velocity
+        self.velocity_ema = velocity if previous_ema is None else (
+            self.velocity_ema_beta * previous_ema
+            + (1 - self.velocity_ema_beta) * velocity
+        )
+        self.last_window_loss = median_loss
+
+        if previous_loss is None:
+            return []
+
+        if self.plateau_cooldown_remaining:
+            self.plateau_cooldown_remaining -= 1
+            self.plateau_streak = 0
+            return []
+
+        velocity_slow = (
+            previous_ema is None
+            or previous_ema <= 0
+            or velocity <= 0
+            or velocity < previous_ema * (1 - self.trigger_ratio)
+        )
+        low_progress = improvement < self.plateau_min_improvement
+        rising = improvement < -self.rise_ratio
+        stalled = rising or (low_progress and velocity_slow)
+
+        self.plateau_streak = self.plateau_streak + 1 if stalled else 0
+        if self.plateau_streak < self.plateau_patience:
+            return []
+
+        old_multiplier = self.lr_multiplier
+        new_multiplier = max(
+            self.plateau_min_multiplier,
+            old_multiplier * self.plateau_drop_factor,
+        )
+        self.plateau_streak = 0
+        self.plateau_cooldown_remaining = self.plateau_cooldown_windows
+        self.velocity_ema = velocity
+
+        if new_multiplier >= old_multiplier * (1 - 1e-12):
+            self.last_event = "plateau detected, but minimum LR multiplier was reached"
+            return []
+
+        self.lr_multiplier = new_multiplier
+        self.decisions += 1
+        self.downward_adjustments += 1
+        self.last_event = (
+            f"monotonic LR drop ×{self.plateau_drop_factor:.3f} after "
+            f"{self.plateau_patience} low-progress windows"
+        )
+        decision_base_lr = self.base_lr_for_step(step + 1)
+        old_lr = decision_base_lr * old_multiplier
+        new_lr = decision_base_lr * new_multiplier
+        reason = (
+            f"median-loss improvement {improvement:.3%} below "
+            f"{self.plateau_min_improvement:.3%}"
+        )
+        if rising:
+            reason = f"representative loss rose by {-improvement:.3%}"
+        return [
+            SchedulerEvent(
+                "lr_monotonic_drop",
+                step,
+                old_lr,
+                new_lr,
+                previous_ema,
+                velocity,
+                reason,
+            )
+        ]
+
     def observe(self, step: int, loss: float) -> list[SchedulerEvent]:
-        if self.schedule != "loss-velocity-wsd" or not self.search_start <= step < self.search_end:
+        adaptive = self.schedule in {"loss-velocity-wsd", "loss-aware-wsqd"}
+        if not adaptive or not self.search_start <= step < self.search_end:
             return []
         if not math.isfinite(loss) or loss <= 0:
             return []
+
         self.window_losses.append(float(loss))
         if len(self.window_losses) < self.window_steps:
-            if step + 1 >= self.search_end and self.mode == "trial":
+            if (
+                self.schedule == "loss-velocity-wsd"
+                and step + 1 >= self.search_end
+                and self.mode == "trial"
+            ):
                 old = self.peak_lr
                 self._set_peak(self.trial_origin_lr or old)
                 self.mode = "monitor"
@@ -274,34 +456,67 @@ class LossVelocityWSD:
                     "adaptive search ended before the trial window completed",
                 )]
             return []
+
         losses, self.window_losses = self.window_losses, []
         velocity = self.estimate_velocity(losses)
         median_loss = self.representative_loss(losses)
         if not math.isfinite(velocity):
             return []
-        return self._finish_trial(step, velocity, median_loss) if self.mode == "trial" \
+
+        if self.schedule == "loss-aware-wsqd":
+            return self._observe_loss_aware_wsqd(step, velocity, median_loss)
+        return (
+            self._finish_trial(step, velocity, median_loss)
+            if self.mode == "trial"
             else self._monitor(step, velocity, median_loss)
+        )
 
     def config_dict(self) -> dict[str, object]:
         return {
-            "schedule": self.schedule, "initial_peak_lr": self.initial_peak_lr,
-            "total_steps": self.total_steps, "warmup_steps": self.warmup_steps,
-            "warmdown_steps": self.warmdown_steps, "search_start": self.search_start,
-            "search_end": self.search_end, "window_steps": self.window_steps,
-            "upscale_factor": self.upscale_factor, "downscale_factor": self.downscale_factor,
-            "factor_decay": self.factor_decay, "trigger_ratio": self.trigger_ratio,
-            "accept_ratio": self.accept_ratio, "velocity_ema_beta": self.velocity_ema_beta,
-            "rise_ratio": self.rise_ratio, "min_peak_lr": self.min_peak_lr,
+            "schedule": self.schedule,
+            "initial_peak_lr": self.initial_peak_lr,
+            "total_steps": self.total_steps,
+            "warmup_steps": self.warmup_steps,
+            "warmdown_steps": self.warmdown_steps,
+            "search_start": self.search_start,
+            "search_end": self.search_end,
+            "window_steps": self.window_steps,
+            "upscale_factor": self.upscale_factor,
+            "downscale_factor": self.downscale_factor,
+            "factor_decay": self.factor_decay,
+            "trigger_ratio": self.trigger_ratio,
+            "accept_ratio": self.accept_ratio,
+            "velocity_ema_beta": self.velocity_ema_beta,
+            "rise_ratio": self.rise_ratio,
+            "min_peak_lr": self.min_peak_lr,
             "max_peak_lr": self.max_peak_lr,
+            "wsqd_shift_steps": self.wsqd_shift_steps,
+            "plateau_min_improvement": self.plateau_min_improvement,
+            "plateau_drop_factor": self.plateau_drop_factor,
+            "plateau_patience": self.plateau_patience,
+            "plateau_cooldown_windows": self.plateau_cooldown_windows,
+            "plateau_min_multiplier": self.plateau_min_multiplier,
         }
 
     def status(self, step: int) -> dict[str, object]:
         return {
-            "name": self.schedule, "phase": self.phase_at(step), "peak_lr": self.peak_lr,
-            "current_lr": self.lr_for_step(step), "window_progress": len(self.window_losses),
-            "window_steps": self.window_steps, "velocity": self.last_velocity,
-            "velocity_ema": self.velocity_ema, "decisions": self.decisions,
-            "accepted_trials": self.accepted_trials, "rejected_trials": self.rejected_trials,
+            "name": self.schedule,
+            "phase": self.phase_at(step),
+            "peak_lr": self.peak_lr,
+            "base_lr": self.base_lr_for_step(step),
+            "current_lr": self.lr_for_step(step),
+            "lr_multiplier": self.lr_multiplier,
+            "window_progress": len(self.window_losses),
+            "window_steps": self.window_steps,
+            "velocity": self.last_velocity,
+            "velocity_ema": self.velocity_ema,
+            "window_improvement": self.last_window_improvement,
+            "plateau_streak": self.plateau_streak,
+            "plateau_patience": self.plateau_patience,
+            "decisions": self.decisions,
+            "downward_adjustments": self.downward_adjustments,
+            "accepted_trials": self.accepted_trials,
+            "rejected_trials": self.rejected_trials,
             "last_event": self.last_event,
         }
 
@@ -309,28 +524,58 @@ class LossVelocityWSD:
 def build_lr_scheduler(args: Any) -> LossVelocityWSD:
     stable_end = args.num_iterations - args.warmdown_iters
     start = args.lr_search_start if args.lr_search_start is not None else args.warmup_iters
-    end = args.lr_search_end if args.lr_search_end is not None else max(start, int(stable_end * 0.75))
+    end = args.lr_search_end if args.lr_search_end is not None else max(
+        start, int(stable_end * 0.75)
+    )
     minimum = args.lr_min_peak if args.lr_min_peak is not None else args.learning_rate * 0.67
     maximum = args.lr_max_peak if args.lr_max_peak is not None else args.learning_rate * 1.25
     return LossVelocityWSD(
-        schedule=args.lr_schedule, initial_peak_lr=args.learning_rate,
-        total_steps=args.num_iterations, warmup_steps=args.warmup_iters,
-        warmdown_steps=args.warmdown_iters, search_start=start, search_end=end,
-        window_steps=args.lr_velocity_window, upscale_factor=args.lr_upscale_factor,
-        downscale_factor=args.lr_downscale_factor, factor_decay=args.lr_factor_decay,
-        trigger_ratio=args.lr_velocity_trigger, accept_ratio=args.lr_velocity_accept,
-        velocity_ema_beta=args.lr_velocity_ema_beta, rise_ratio=args.lr_loss_rise_guard,
-        min_peak_lr=minimum, max_peak_lr=maximum,
+        schedule=args.lr_schedule,
+        initial_peak_lr=args.learning_rate,
+        total_steps=args.num_iterations,
+        warmup_steps=args.warmup_iters,
+        warmdown_steps=args.warmdown_iters,
+        search_start=start,
+        search_end=end,
+        window_steps=args.lr_velocity_window,
+        upscale_factor=args.lr_upscale_factor,
+        downscale_factor=args.lr_downscale_factor,
+        factor_decay=args.lr_factor_decay,
+        trigger_ratio=args.lr_velocity_trigger,
+        accept_ratio=args.lr_velocity_accept,
+        velocity_ema_beta=args.lr_velocity_ema_beta,
+        rise_ratio=args.lr_loss_rise_guard,
+        min_peak_lr=minimum,
+        max_peak_lr=maximum,
+        wsqd_shift_steps=args.lr_wsqd_shift,
+        plateau_min_improvement=args.lr_plateau_min_improvement,
+        plateau_drop_factor=args.lr_plateau_drop_factor,
+        plateau_patience=args.lr_plateau_patience,
+        plateau_cooldown_windows=args.lr_plateau_cooldown,
+        plateau_min_multiplier=args.lr_plateau_min_multiplier,
     )
 
 
 SCHEDULER_DEFAULTS: dict[str, object] = {
-    "lr_schedule": "wsd", "lr_search_start": None, "lr_search_end": None,
-    "lr_velocity_window": 128, "lr_upscale_factor": 1.08,
-    "lr_downscale_factor": 1.05, "lr_factor_decay": 0.90,
-    "lr_velocity_trigger": 0.12, "lr_velocity_accept": 0.03,
-    "lr_velocity_ema_beta": 0.80, "lr_loss_rise_guard": 0.06,
-    "lr_min_peak": None, "lr_max_peak": None,
+    "lr_schedule": "wsd",
+    "lr_search_start": None,
+    "lr_search_end": None,
+    "lr_velocity_window": 128,
+    "lr_upscale_factor": 1.08,
+    "lr_downscale_factor": 1.05,
+    "lr_factor_decay": 0.90,
+    "lr_velocity_trigger": 0.12,
+    "lr_velocity_accept": 0.03,
+    "lr_velocity_ema_beta": 0.80,
+    "lr_loss_rise_guard": 0.06,
+    "lr_min_peak": None,
+    "lr_max_peak": None,
+    "lr_wsqd_shift": 512.0,
+    "lr_plateau_min_improvement": 0.02,
+    "lr_plateau_drop_factor": 0.80,
+    "lr_plateau_patience": 2,
+    "lr_plateau_cooldown": 1,
+    "lr_plateau_min_multiplier": 0.25,
 }
 
 
@@ -348,8 +593,13 @@ def validate_scheduler_resume_args(checkpoint: dict[str, Any], args: Any) -> Non
         )
 
 
-def replay_scheduler_history(scheduler: LossVelocityWSD, log_path: Any, *, next_step: int) -> None:
-    if scheduler.schedule == "wsd":
+def replay_scheduler_history(
+    scheduler: LossVelocityWSD,
+    log_path: Any,
+    *,
+    next_step: int,
+) -> None:
+    if scheduler.schedule in {"wsd", "wsqd"}:
         return
     path = Path(log_path)
     if not path.exists():
@@ -384,10 +634,17 @@ def attach_lr_scheduler(runtime: Any) -> LossVelocityWSD:
         replay_scheduler_history(scheduler, runtime.log_path, next_step=runtime.start_step)
     runtime.lr_scheduler = scheduler
     runtime.display.set_scheduler_status(scheduler.status(runtime.start_step))
-    json_log(runtime.log_path, {
-        "event": "lr_scheduler_restored" if runtime.checkpoint else "lr_scheduler_config",
-        "next_step": runtime.start_step,
-        "config": scheduler.config_dict(),
-        "status": scheduler.status(runtime.start_step),
-    })
+    json_log(
+        runtime.log_path,
+        {
+            "event": (
+                "lr_scheduler_restored"
+                if runtime.checkpoint
+                else "lr_scheduler_config"
+            ),
+            "next_step": runtime.start_step,
+            "config": scheduler.config_dict(),
+            "status": scheduler.status(runtime.start_step),
+        },
+    )
     return scheduler
