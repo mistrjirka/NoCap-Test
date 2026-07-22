@@ -7,6 +7,9 @@ on:
     paths:
       - .scheduler-upload/**
       - .github/workflows/apply-monotonic-wsqd.yml
+  pull_request:
+    branches:
+      - master
 
 permissions:
   contents: write
