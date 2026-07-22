@@ -1,11 +1,12 @@
-name: Apply monotonic WSqD scheduler patch
+name: Apply monotonic WSqD implementation
 
 on:
   push:
     branches:
       - agent/monotonic-wsqd
     paths:
-      - .patch-upload/ready
+      - .scheduler-upload/**
+      - .github/workflows/apply-monotonic-wsqd.yml
 
 permissions:
   contents: write
@@ -20,34 +21,14 @@ jobs:
           ref: agent/monotonic-wsqd
           fetch-depth: 0
 
-      - name: Verify patch chunks
+      - name: Verify and extract staged source
         shell: bash
         run: |
           set -euo pipefail
-          cat > /tmp/chunks.sha256 <<'EOF'
-          3eaaeb1e15f926f9bcb3ae3dee47f84acf331b0b2041920e969f011e45fc94b7  .patch-upload/part-00
-          db3bc7fb4b4bcc094d3bdf68b89ad9e36373b4895ec8f5fec93f2ff11fd6c50b  .patch-upload/part-01
-          edeea4f48096deedcca805edca91a51a29b2d7a5d9c912bd13a45d6fc746de4e  .patch-upload/part-02
-          1724314815aec80bf9b2f2f81ab857ac7449b3e6c1dfc32aa30f39254cdf06ab  .patch-upload/part-03
-          90b89e098da7ea9607c2ece888134040a8e6aca7e6b829ef39627b893edfc982  .patch-upload/part-04
-          911e20c9aa54cb337619a7d4110763669cfc03517676c181b15beb0b04f4fa5c  .patch-upload/part-05
-          2388f1efda173576552baba19e68d3d2fb653211c09c03a923a730e19b3715d2  .patch-upload/part-06
-          fc5d12efb8159a59ed4f1cb3d38a5f89252168ba2b8234f47fe6a62ff3e1f9cd  .patch-upload/part-07
-          37eb9210a9fecea651787977f8802b4accbd049687208c8f92d7975e6fe17c47  .patch-upload/part-08
-          beba0e8eebdc5089a8ae332c0b7d0cbb7b28c48f3c78fadb86a1bd08632efb49  .patch-upload/part-09
-          83d86a35c096b5e10879e551f21e6c43d0ab06fb4f66d9b33ab0033026afe6d9  .patch-upload/part-10
-          EOF
-          sha256sum --check /tmp/chunks.sha256
-          cat .patch-upload/part-* > /tmp/monotonic-wsqd.patch
-          echo 'ae94848c548c3c0216e07105a7c24f00d13d54f3fb46f2a76dfa038a78413f4f  /tmp/monotonic-wsqd.patch' | sha256sum --check
-
-      - name: Apply scheduler patch
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -f SCHEDULER.md scheduler_test.py
-          git apply /tmp/monotonic-wsqd.patch
-          chmod +x scripts/run_*wsqd*.sh
+          tr -d '[:space:]' < .scheduler-upload/payload.b64 | base64 --decode > /tmp/monotonic-wsqd.tar.gz
+          echo 'e3139f29d3881365bc84e0c7a96a7b0b715680f7301cee3c193ae381149ddb39  /tmp/monotonic-wsqd.tar.gz' | sha256sum --check
+          tar -tzf /tmp/monotonic-wsqd.tar.gz
+          tar -xzf /tmp/monotonic-wsqd.tar.gz
 
       - name: Validate scheduler implementation
         shell: bash
@@ -55,18 +36,29 @@ jobs:
           set -euo pipefail
           python -m pip install --quiet rich
           python -m py_compile \
-            training/lr_scheduler.py training/cli.py training/display.py \
-            training/loop.py scheduler_test.py
+            training/lr_scheduler.py \
+            training/cli.py \
+            training/display.py \
+            training/loop.py \
+            scheduler_test.py
           python scheduler_test.py
-          for script in scripts/run_*wsqd*.sh; do bash -n "$script"; done
+          bash -n \
+            scripts/run_wsqd_probe_3090.sh \
+            scripts/run_loss_aware_wsqd_probe_3090.sh \
+            scripts/run_wsqd_3090.sh \
+            scripts/run_loss_aware_wsqd_3090.sh \
+            scripts/run_wsqd_probe_v100.sh \
+            scripts/run_loss_aware_wsqd_probe_v100.sh \
+            scripts/run_wsqd_v100.sh \
+            scripts/run_loss_aware_wsqd_v100.sh
 
-      - name: Commit scheduler implementation
+      - name: Commit implementation
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf .patch-upload .github/workflows/apply-monotonic-wsqd.yml
+          rm -rf .scheduler-upload .patch-upload .github/workflows/apply-monotonic-wsqd.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
-          git commit -m 'Add monotonic WSqD learning-rate schedules'
+          git commit -m 'Add monotonic WSqD schedulers'
           git push origin HEAD:agent/monotonic-wsqd
