@@ -1,0 +1,38 @@
+files:
+diagnostics.txt 7 bytes
+part-00 3500 bytes
+part-01 3500 bytes
+part-02 3500 bytes
+part-03 3500 bytes
+part-04 3500 bytes
+part-05 3500 bytes
+part-06 752 bytes
+payload.b64 20200 bytes
+ready 6 bytes
+ready-final 20 bytes
+
+hashes:
+a051726fa2bc9a0fa70ad45a66a74e04f8f31a8d30af62d7ed411c3cfa2f6a74  .scheduler-upload/part-00
+2106e3676e96d7a9251f0e01fd12ffabb0c03b416df34c334bda0e1534dad854  .scheduler-upload/part-01
+3f934fd07898b5a3ad88a2bb85ca0bf23e04bc38ebb10ceea459e79a795d2d1d  .scheduler-upload/part-02
+e90f11459e0098cae0330cb21ccab7bfc801a92868ff5a3e7768c2ef22a5a543  .scheduler-upload/part-03
+dc95cc1014d30f386d68d1955baf51c4388be5ccf2cb0165b99e045d8439559d  .scheduler-upload/part-04
+66125b62bf470f317b9f173f7d0fa0338dc8118694a09364969bf84bcea439d0  .scheduler-upload/part-05
+03c55d2758d19b1baac710e656d309a5f5e7cf6b616726a141002274b2ee1ca5  .scheduler-upload/part-06
+
+base64_decode_rc=0
+ba5355b3e2e73990295b9b325ff5b2f1bba4c7dbc2a486a2643aea55dcdb019c  /tmp/monotonic-wsqd.tar.gz
+
+gzip: /tmp/monotonic-wsqd.tar.gz: invalid compressed data--crc error
+
+gzip: /tmp/monotonic-wsqd.tar.gz: invalid compressed data--length error
+gzip_test_rc=1
+training/lr_scheduler.py
+tar: Skipping to next header
+
+gzip: stdin: invalid compressed data--crc error
+
+gzip: stdin: invalid compressed data--length error
+tar: Child returned status 1
+tar: Error is not recoverable: exiting now
+tar_list_rc=2
