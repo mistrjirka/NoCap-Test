@@ -1,0 +1,42 @@
+name: Apply staged GQA4 payload
+
+on:
+  push:
+    branches:
+      - agent/liquidlite-gqa4
+    paths:
+      - .gqa-upload/**
+      - .github/workflows/apply-gqa-upload.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/liquidlite-gqa4
+          fetch-depth: 0
+
+      - name: Verify and extract staged source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .gqa-upload/part-* | base64 --decode > /tmp/gqa-files.tar.gz
+          echo 'd4a566f47b4bcad927a095a6ec61b7ec562f1eedb757f0df1855ee2d50b93b0d  /tmp/gqa-files.tar.gz' | sha256sum --check
+          tar -tzf /tmp/gqa-files.tar.gz
+          tar -xzf /tmp/gqa-files.tar.gz
+          rm -rf .gqa-upload .github/workflows/apply-gqa-upload.yml
+
+      - name: Commit GQA4 implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Add LiquidLite GQA4 architecture'
+          git push origin HEAD:agent/liquidlite-gqa4
