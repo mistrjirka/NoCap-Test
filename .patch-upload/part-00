@@ -1,0 +1,146 @@
+--- a/training/lr_scheduler.py
++++ b/training/lr_scheduler.py
+@@ -1,8 +1,20 @@
+-"""Fixed WSD and a conservative training-loss-velocity WSD controller.
+-
+-The adaptive mode is inspired by AdaLRS, but is intentionally not an exact
+-reproduction: it avoids model/optimizer backtracking so speedrun overhead and
+-token accounting remain explicit.
++"""Learning-rate schedules for NoCap pretraining.
++
++Supported controllers:
++
++* ``wsd``: the original fixed Warmup–Stable–Decay schedule.
++* ``loss-velocity-wsd``: the earlier AdaLRS-inspired peak-LR search. It is kept
++  for reproducibility, but its forward-only up-trials are experimental.
++* ``wsqd``: a paper-inspired shifted inverse-square-root base with a final
++  linear cooldown.
++* ``loss-aware-wsqd``: WSqD plus conservative, downward-only loss-triggered
++  multiplier reductions.
++
++The loss-aware controller never raises the learning rate after warmup. This is
++intentional: AdaLRS relies on trial-state backtracking, and its own ablation
++reports that removing backtracking can leave persistent damage after an
++oversized LR trial. Model/optimizer backtracking is undesirable in a timed
++speedrun, so the safer adaptation is monotonic.
+ """
+ 
+ from __future__ import annotations
+@@ -13,7 +25,12 @@
+ from pathlib import Path
+ from typing import Any, Literal
+ 
+-ScheduleName = Literal["wsd", "loss-velocity-wsd"]
++ScheduleName = Literal[
++    "wsd",
++    "loss-velocity-wsd",
++    "wsqd",
++    "loss-aware-wsqd",
++]
+ 
+ 
+ @dataclass(frozen=True)
+@@ -31,6 +48,8 @@
+ 
+ 
+ class LossVelocityWSD:
++    """Backwards-compatible controller implementing all supported schedules."""
++
+     def __init__(
+         self,
+         *,
+@@ -51,6 +70,12 @@
+         rise_ratio: float,
+         min_peak_lr: float,
+         max_peak_lr: float,
++        wsqd_shift_steps: float = 512.0,
++        plateau_min_improvement: float = 0.02,
++        plateau_drop_factor: float = 0.80,
++        plateau_patience: int = 2,
++        plateau_cooldown_windows: int = 1,
++        plateau_min_multiplier: float = 0.25,
+     ) -> None:
+         self.schedule = schedule
+         self.initial_peak_lr = initial_peak_lr
+@@ -69,8 +94,16 @@
+         self.rise_ratio = rise_ratio
+         self.min_peak_lr = min_peak_lr
+         self.max_peak_lr = max_peak_lr
++
++        self.wsqd_shift_steps = float(wsqd_shift_steps)
++        self.plateau_min_improvement = plateau_min_improvement
++        self.plateau_drop_factor = plateau_drop_factor
++        self.plateau_patience = plateau_patience
++        self.plateau_cooldown_windows = plateau_cooldown_windows
++        self.plateau_min_multiplier = plateau_min_multiplier
+         self._validate()
+ 
++        # Existing loss-velocity WSD state.
+         self.peak_lr = initial_peak_lr
+         self.mode = "monitor"
+         self.window_losses: list[float] = []
+@@ -89,18 +122,30 @@
+         self.rejected_trials = 0
+         self.last_event = ""
+ 
++        # Downward-only loss-aware WSqD state.
++        self.lr_multiplier = 1.0
++        self.plateau_streak = 0
++        self.plateau_cooldown_remaining = 0
++        self.last_window_improvement: float | None = None
++        self.downward_adjustments = 0
++
+     def _validate(self) -> None:
+         stable_end = self.total_steps - self.warmdown_steps
+-        if self.schedule not in {"wsd", "loss-velocity-wsd"}:
++        if self.schedule not in {
++            "wsd",
++            "loss-velocity-wsd",
++            "wsqd",
++            "loss-aware-wsqd",
++        }:
+             raise ValueError(f"Unsupported LR schedule: {self.schedule}")
+         if self.initial_peak_lr <= 0 or self.total_steps <= 0:
+             raise ValueError("Peak LR and total steps must be positive")
+         if not 0 <= self.warmup_steps <= stable_end:
+             raise ValueError("Warmup overlaps terminal warmdown")
+         if not self.warmup_steps <= self.search_start <= self.search_end <= stable_end:
+-            raise ValueError("LR search must lie between warmup and warmdown")
++            raise ValueError("LR observation interval must lie between warmup and warmdown")
+         if self.window_steps < 8:
+-            raise ValueError("Loss-velocity window must contain at least 8 steps")
++            raise ValueError("Loss window must contain at least 8 steps")
+         if self.upscale_factor <= 1 or self.downscale_factor <= 1:
+             raise ValueError("LR scale factors must exceed 1")
+         if not 0 < self.factor_decay <= 1:
+@@ -111,10 +156,26 @@
+             raise ValueError("Invalid EMA or loss-rise guard")
+         if not 0 < self.min_peak_lr <= self.initial_peak_lr <= self.max_peak_lr:
+             raise ValueError("Peak-LR bounds must contain the initial peak")
++        if self.wsqd_shift_steps < 0:
++            raise ValueError("WSqD shift must be non-negative")
++        if self.plateau_min_improvement < 0:
++            raise ValueError("Plateau minimum improvement cannot be negative")
++        if not 0 < self.plateau_drop_factor < 1:
++            raise ValueError("Plateau drop factor must be in (0, 1)")
++        if self.plateau_patience < 1:
++            raise ValueError("Plateau patience must be at least 1 window")
++        if self.plateau_cooldown_windows < 0:
++            raise ValueError("Plateau cooldown cannot be negative")
++        if not 0 < self.plateau_min_multiplier <= 1:
++            raise ValueError("Minimum LR multiplier must be in (0, 1]")
+ 
+     @property
+     def stable_end(self) -> int:
+         return self.total_steps - self.warmdown_steps
++
++    @property
++    def uses_wsqd_base(self) -> bool:
++        return self.schedule in {"wsqd", "loss-aware-wsqd"}
+ 
+     def phase_at(self, step: int) -> str:
+         if self.warmup_steps and step < self.warmup_steps:
+@@ -123,11 +184,41 @@
+             return "warmdown"
+         if self.schedule == "loss-velocity-wsd" and self.search_start <= step < self.search_end:
+             return "lr-trial" if self.mode == "trial" else "lr-search"
