@@ -14,6 +14,7 @@ global causal attention and LFM2-inspired gated short convolutions.
 | `dense512` | 12 attention | tied 512 + 512↔768 projections | ReLU² | 111,452,672 |
 | `dense512-gated` | 12 attention | gated input projection | ReLU² | 111,845,888 |
 | `liquidlite512` | 8 attention + 4 shortconv | tied 512 | ReLU² | 111,461,888 |
+| `liquidlite512-gqa4` | 8 GQA + 4 shortconv | tied 512 | ReLU² | 105,170,432 |
 | `liquidlite512-gelu` | 8 attention + 4 shortconv | tied 512 | GELU | 111,461,888 |
 
 LiquidLite uses the repeating pattern:
@@ -89,13 +90,17 @@ runs evaluate exactly 1,048,576 validation tokens.
 python smoke_test.py
 python resume_test.py
 python scheduler_test.py
+python gqa_test.py
+# On an NVIDIA machine:
+python gqa_cuda_smoke.py
 bash scripts/run_smoke.sh
 ```
 
 The tests check parameter counts, tied-weight initialization, finite
 forward/backward passes, strict convolution causality, TTY zoom logic, atomic
-checkpoint publication, data-stream continuity, RNG restoration, and AdamW
-continuation.
+checkpoint publication, data-stream continuity, RNG restoration, AdamW
+continuation, GQA parameter counts, CPU fallback, strict causality, and the
+native CUDA GQA forward/backward path.
 
 ## Recommended experiment order
 
@@ -107,11 +112,13 @@ bash scripts/run_probe_3090.sh baseline
 bash scripts/run_probe_3090.sh dense512
 bash scripts/run_probe_3090.sh liquidlite512
 bash scripts/run_probe_3090.sh liquidlite512-gelu
+bash scripts/run_probe_3090.sh liquidlite512-gqa4
 
 # V100
 bash scripts/run_probe_v100.sh baseline
 bash scripts/run_probe_v100.sh dense512
 bash scripts/run_probe_v100.sh liquidlite512
+bash scripts/run_probe_v100.sh liquidlite512-gqa4
 ```
 
 Compare equal-step validation loss, median step time, and validation loss versus
@@ -126,6 +133,7 @@ RTX 3090:
 bash scripts/run_baseline_3090.sh |& tee baseline-3090.log
 bash scripts/run_dense_3090.sh |& tee dense512-3090.log
 bash scripts/run_liquidlite_3090.sh |& tee liquidlite-3090.log
+bash scripts/run_liquidlite_gqa4_3090.sh |& tee liquidlite-gqa4-3090.log
 ```
 
 V100:
@@ -134,6 +142,7 @@ V100:
 bash scripts/run_baseline_v100.sh |& tee baseline-v100.log
 bash scripts/run_dense_v100.sh |& tee dense512-v100.log
 bash scripts/run_liquidlite_v100.sh |& tee liquidlite-v100.log
+bash scripts/run_liquidlite_gqa4_v100.sh |& tee liquidlite-gqa4-v100.log
 ```
 
 ## Loss-velocity WSD experiment
@@ -228,6 +237,40 @@ bash scripts/run_liquidlite_3090.sh --save_every 0
 bash scripts/run_liquidlite_3090.sh --keep_step_checkpoints
 ```
 
+## LiquidLite-GQA4
+
+`liquidlite512-gqa4` keeps LiquidLite's four short-convolution layers and eight
+global-attention layers, but changes only the attention projections from 12
+query/12 key/12 value heads to 12 query/4 key/4 value heads. Residual width,
+head dimension, MLPs, vocabulary interface, depth, and convolution placement are
+unchanged. This removes 6,291,456 projection parameters:
+
+```text
+LiquidLite-512:       111,461,888 parameters
+LiquidLite-512-GQA4:  105,170,432 parameters
+```
+
+The clean architecture-only probe uses the existing fixed schedule:
+
+```bash
+bash scripts/run_probe_3090.sh liquidlite512-gqa4 1536 \
+  |& tee liquidlite-gqa4-fixed-probe.log
+```
+
+The tuned adaptive probe starts near the lower peak selected by the completed
+LiquidLite experiment and keeps a bounded search range:
+
+```bash
+bash scripts/run_liquidlite_gqa4_probe_3090.sh 1536 \
+  |& tee liquidlite-gqa4-adaptive-probe.log
+```
+
+PyTorch's native `scaled_dot_product_attention(..., enable_gqa=True)` path is
+used on CUDA. CPU structural tests explicitly expand KV heads because native GQA
+is CUDA-only. `gqa_cuda_smoke.py` exercises the real fused path on the target
+GPU. GQA remains experimental in PyTorch, so record the selected kernel
+and actual RTX 3090/V100 step time before claiming a speedup. See `GQA.md`.
+
 ## Better terminal graphs
 
 The TTY now uses explicitly labelled adaptive ranges:
@@ -280,5 +323,7 @@ baseline on that GPU. Do not train on the validation shard.
 - This repository is **not** an official LFM2 implementation. It retains the
   NoCap residual scaling and mostly-global attention to reduce training risk at
   111M parameters and a 2.5B-token budget.
+- PyTorch GQA is experimental and may choose different attention backends across
+  RTX 3090 and V100; CUDA convergence and speed must be measured on both targets.
 - CUDA convergence and speed must be measured on the target machines; this
   packaging environment has no NVIDIA GPU.

@@ -80,6 +80,7 @@ def build_runtime(args: argparse.Namespace) -> Runtime:
     config = config_from_preset(
         args.preset,
         embedding_dim=args.embedding_dim,
+        n_kv_head=args.n_kv_head,
         activation=args.activation,
         embedding_projection=args.embedding_projection,
         qk_norm=args.qk_norm,

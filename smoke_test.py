@@ -16,6 +16,7 @@ EXPECTED_COUNTS = {
     "dense512": 111_452_672,
     "dense512-gated": 111_845_888,
     "liquidlite512": 111_461_888,
+    "liquidlite512-gqa4": 105_170_432,
     "liquidlite512-gelu": 111_461_888,
 }
 

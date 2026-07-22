@@ -18,6 +18,7 @@ meaningfully damaging convergence. The experiment is successful only if it
 improves validation loss per measured training second—not merely FLOPs or
 parameter count.
 
+
 ## Loss-velocity WSD
 
 The scheduler experiment keeps WSD's warmup and terminal linear decay, but uses
@@ -25,16 +26,19 @@ only logged training losses to search for a better stable-phase peak learning
 rate. It monitors a robust least-squares slope of smoothed log loss. When descent
 velocity weakens, it runs a mild higher-LR trial. A clearly better velocity keeps
 the trial; a failed trial searches slightly below the prior LR. Adjustment sizes
-shrink over time and the search stops well before decay.
+shrink over time and the search stops well before decay. Validation loss never
+controls LR.
 
-This is intentionally a conservative AdaLRS-inspired variant without parameter
-backtracking. Validation loss never controls LR. The key ablations are:
+## LiquidLite-GQA4
 
-1. fixed WSD with 1,024-step decay;
-2. loss-velocity WSD with the same decay;
-3. loss-velocity WSD with a 512-step (~10.7%) decay;
-4. each schedule on both `baseline` and `dense512` before combining it with
-   LiquidLite.
+This ablation keeps the complete LiquidLite layout but shares each key/value head
+across three query heads in its eight attention layers. The expected advantage is
+smaller QKV projections and lower parameter traffic without reducing residual
+width, attention depth, MLP capacity, or the number of global mixers.
+
+The model has 105,170,432 parameters, 6,291,456 fewer than LiquidLite. The idea
+is successful only if equal-step validation remains close while measured
+training time improves on an otherwise idle GPU.
 
 ## Required ablations
 
@@ -44,6 +48,7 @@ Compare at least:
 2. `dense512`: 512 vocabulary + ReLU² + 12 attention.
 3. `liquidlite512`: 512 vocabulary + ReLU² + 8 attention + 4 shortconv.
 4. `liquidlite512-gelu`: isolates the hybrid mixer from ReLU².
+5. `liquidlite512-gqa4`: isolates grouped-query attention from other changes.
 
 Use identical hardware, power limit, software, data order and training settings.
 Start with 1,024-step probes before full runs.
@@ -55,4 +60,5 @@ Start with 1,024-step probes before full runs.
 | baseline | | | | | 123,532,032 | | | |
 | dense512 | | | | | 111,452,672 | | | |
 | liquidlite512 | | | | | 111,461,888 | | | |
+| liquidlite512-gqa4 | | | | | 105,170,432 | | | |
 | liquidlite512-gelu | | | | | 111,461,888 | | | |

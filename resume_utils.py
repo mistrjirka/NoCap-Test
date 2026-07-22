@@ -22,6 +22,7 @@ CRITICAL_ARGUMENTS = (
     "input_val_bin",
     "preset",
     "embedding_dim",
+    "n_kv_head",
     "activation",
     "embedding_projection",
     "qk_norm",
@@ -156,6 +157,16 @@ def _normalise(value: Any) -> Any:
     return value
 
 
+def normalise_model_config(value: Any) -> Any:
+    """Treat pre-GQA checkpoints as ordinary multi-head attention configs."""
+    normalised = _normalise(value)
+    if isinstance(normalised, dict):
+        normalised = dict(normalised)
+        if "n_kv_head" not in normalised and "n_head" in normalised:
+            normalised["n_kv_head"] = normalised["n_head"]
+    return normalised
+
+
 def validate_resume_checkpoint(
     checkpoint: dict[str, Any],
     args: Namespace,
@@ -174,7 +185,9 @@ def validate_resume_checkpoint(
             "prefetch, GradScaler, and RNG state."
         )
 
-    if _normalise(checkpoint.get("model_config")) != _normalise(model_config):
+    if normalise_model_config(
+        checkpoint.get("model_config")
+    ) != normalise_model_config(model_config):
         raise ValueError("Resume model configuration differs from the checkpoint")
 
     saved_args = checkpoint.get("args", {})

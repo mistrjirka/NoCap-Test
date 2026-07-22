@@ -64,11 +64,18 @@ def build_parser() -> argparse.ArgumentParser:
             "dense512",
             "dense512-gated",
             "liquidlite512",
+            "liquidlite512-gqa4",
             "liquidlite512-gelu",
         ),
         default="dense512",
     )
     parser.add_argument("--embedding_dim", type=int, default=None)
+    parser.add_argument(
+        "--n_kv_head",
+        type=int,
+        default=None,
+        help="Key/value attention heads; query heads remain fixed by the preset",
+    )
     parser.add_argument("--activation", choices=("gelu", "relu2"), default=None)
     parser.add_argument(
         "--embedding_projection",

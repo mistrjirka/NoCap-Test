@@ -72,6 +72,7 @@ class GPTConfig:
     vocab_size: int = 50_257
     n_layer: int = 12
     n_head: int = 12
+    n_kv_head: int | None = None
     n_embd: int = 768
     embedding_dim: int = 512
     mlp_ratio: int = 4
@@ -85,12 +86,18 @@ class GPTConfig:
     def head_dim(self) -> int:
         return self.n_embd // self.n_head
 
+    @property
+    def kv_head_count(self) -> int:
+        return self.n_head if self.n_kv_head is None else self.n_kv_head
+
     def mixer_for_layer(self, layer_idx: int) -> MixerName:
         return "shortconv" if layer_idx in self.conv_layers else "attention"
 
     def validate(self) -> None:
         if self.n_embd % self.n_head != 0:
             raise ValueError("n_embd must be divisible by n_head")
+        if self.kv_head_count <= 0 or self.n_head % self.kv_head_count != 0:
+            raise ValueError("n_kv_head must be positive and divide n_head")
         if self.head_dim % 2 != 0:
             raise ValueError("Attention head dimension must be even for RoPE")
         if self.embedding_dim <= 0 or self.embedding_dim > self.n_embd:
@@ -112,13 +119,16 @@ class GPTConfig:
             raise ValueError(f"conv layer indices outside [0, {self.n_layer}): {invalid}")
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        result = asdict(self)
+        result["n_kv_head"] = self.kv_head_count
+        return result
 
 
 def config_from_preset(
     preset: str,
     *,
     embedding_dim: int | None = None,
+    n_kv_head: int | None = None,
     activation: ActivationName | None = None,
     embedding_projection: ProjectionName | None = None,
     qk_norm: bool | None = None,
@@ -130,24 +140,37 @@ def config_from_preset(
     liquid_layers = (0, 3, 6, 9)
     presets: dict[str, GPTConfig] = {
         "baseline": GPTConfig(
+            n_kv_head=12,
             embedding_dim=768,
             activation="gelu",
             embedding_projection="linear",
             qk_norm=False,
         ),
         "dense512": GPTConfig(
+            n_kv_head=12,
             embedding_dim=512,
             activation="relu2",
             embedding_projection="linear",
             qk_norm=False,
         ),
         "dense512-gated": GPTConfig(
+            n_kv_head=12,
             embedding_dim=512,
             activation="relu2",
             embedding_projection="gated-silu",
             qk_norm=False,
         ),
         "liquidlite512": GPTConfig(
+            n_kv_head=12,
+            embedding_dim=512,
+            activation="relu2",
+            embedding_projection="linear",
+            qk_norm=False,
+            conv_layers=liquid_layers,
+            conv_kernel_size=3,
+        ),
+        "liquidlite512-gqa4": GPTConfig(
+            n_kv_head=4,
             embedding_dim=512,
             activation="relu2",
             embedding_projection="linear",
@@ -156,6 +179,7 @@ def config_from_preset(
             conv_kernel_size=3,
         ),
         "liquidlite512-gelu": GPTConfig(
+            n_kv_head=12,
             embedding_dim=512,
             activation="gelu",
             embedding_projection="linear",
@@ -171,6 +195,7 @@ def config_from_preset(
         vocab_size=base.vocab_size,
         n_layer=base.n_layer,
         n_head=base.n_head,
+        n_kv_head=n_kv_head if n_kv_head is not None else base.n_kv_head,
         n_embd=base.n_embd,
         embedding_dim=embedding_dim if embedding_dim is not None else base.embedding_dim,
         mlp_ratio=base.mlp_ratio,
@@ -196,20 +221,25 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
         self.n_head = config.n_head
+        self.n_kv_head = config.kv_head_count
         self.n_embd = config.n_embd
         self.head_dim = config.head_dim
+        self.q_dim = self.n_head * self.head_dim
+        self.kv_dim = self.n_kv_head * self.head_dim
         self.qk_norm = config.qk_norm
-        self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=False)
+        self.c_attn = nn.Linear(
+            self.n_embd, self.q_dim + 2 * self.kv_dim, bias=False
+        )
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.rotary = Rotary(self.head_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len, channels = x.shape
         qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=-1)
+        q, k, v = qkv.split((self.q_dim, self.kv_dim, self.kv_dim), dim=-1)
         q = q.view(batch, seq_len, self.n_head, self.head_dim)
-        k = k.view(batch, seq_len, self.n_head, self.head_dim)
-        v = v.view(batch, seq_len, self.n_head, self.head_dim)
+        k = k.view(batch, seq_len, self.n_kv_head, self.head_dim)
+        v = v.view(batch, seq_len, self.n_kv_head, self.head_dim)
 
         if self.qk_norm:
             q = rmsnorm(q)
@@ -218,11 +248,21 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(q)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
+
+        use_gqa = self.n_kv_head != self.n_head
+        # PyTorch's fused GQA path is currently CUDA-only. CPU tests expand KV
+        # heads explicitly while real RTX 3090/V100 runs request native GQA.
+        if use_gqa and not q.is_cuda:
+            repeats = self.n_head // self.n_kv_head
+            k = k.repeat_interleave(repeats, dim=2)
+            v = v.repeat_interleave(repeats, dim=2)
+
         y = F.scaled_dot_product_attention(
             q.transpose(1, 2),
             k.transpose(1, 2),
             v.transpose(1, 2),
             is_causal=True,
+            enable_gqa=use_gqa and q.is_cuda,
         )
         y = y.transpose(1, 2).contiguous().view(batch, seq_len, channels)
         return self.c_proj(y)
@@ -414,8 +454,15 @@ class GPT(nn.Module):
         attention = names.count("attention")
         shortconv = names.count("shortconv")
         if shortconv == 0:
-            return f"{attention} attention"
-        return (
-            f"{attention} attention + {shortconv} gated shortconv "
-            f"(layers {[i + 1 for i in self.config.conv_layers]})"
-        )
+            summary = f"{attention} attention"
+        else:
+            summary = (
+                f"{attention} attention + {shortconv} gated shortconv "
+                f"(layers {[i + 1 for i in self.config.conv_layers]})"
+            )
+        if self.config.kv_head_count != self.config.n_head:
+            summary += (
+                f"; GQA {self.config.n_head} query / "
+                f"{self.config.kv_head_count} KV heads"
+            )
+        return summary

@@ -83,6 +83,7 @@ def test_strict_compatibility() -> None:
         "input_val_bin": "val/*.bin",
         "preset": "dense512",
         "embedding_dim": None,
+        "n_kv_head": None,
         "activation": None,
         "embedding_projection": None,
         "qk_norm": None,
@@ -106,7 +107,12 @@ def test_strict_compatibility() -> None:
         "seed": 1337,
     }
     args = argparse.Namespace(**values)
-    config = {"embedding_dim": 512, "conv_layers": []}
+    config = {
+        "embedding_dim": 512,
+        "n_head": 12,
+        "n_kv_head": 12,
+        "conv_layers": [],
+    }
     checkpoint = {
         "format_version": CHECKPOINT_FORMAT_VERSION,
         "args": dict(values),
@@ -160,6 +166,7 @@ def test_model_optimizer_continuation() -> None:
         vocab_size=31,
         n_layer=1,
         n_head=2,
+        n_kv_head=2,
         n_embd=16,
         embedding_dim=12,
         mlp_ratio=1,
@@ -183,7 +190,11 @@ def test_model_optimizer_continuation() -> None:
         for _ in range(2)
     ]
 
-    def step(model: GPT, optimizer: torch.optim.Optimizer, batch: tuple[torch.Tensor, torch.Tensor]) -> None:
+    def step(
+        model: GPT,
+        optimizer: torch.optim.Optimizer,
+        batch: tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
         _, loss = model(batch[0], batch[1], return_logits=False)
         assert loss is not None
         loss.backward()
