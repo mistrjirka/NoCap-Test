@@ -114,9 +114,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning_rate", type=float, default=0.0018)
     parser.add_argument(
         "--lr_schedule",
-        choices=("wsd", "loss-velocity-wsd"),
+        choices=("wsd", "loss-velocity-wsd", "wsqd", "loss-aware-wsqd"),
         default="wsd",
-        help="Fixed WSD or an AdaLRS-inspired training-loss velocity overlay",
+        help=(
+            "Fixed WSD; legacy forward-only loss-velocity search; paper-inspired "
+            "shifted inverse-square-root WSqD; or downward-only loss-aware WSqD"
+        ),
     )
     parser.add_argument("--warmup_iters", type=int, default=256)
     parser.add_argument("--warmdown_iters", type=int, default=1024)
@@ -133,6 +136,48 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr_loss_rise_guard", type=float, default=0.06)
     parser.add_argument("--lr_min_peak", type=float, default=None)
     parser.add_argument("--lr_max_peak", type=float, default=None)
+    parser.add_argument(
+        "--lr_wsqd_shift",
+        type=float,
+        default=512.0,
+        help=(
+            "WSqD shift T0 in optimizer steps; larger values make the square-root "
+            "base flatter near the end of warmup"
+        ),
+    )
+    parser.add_argument(
+        "--lr_plateau_min_improvement",
+        type=float,
+        default=0.02,
+        help=(
+            "Minimum median training-loss improvement between complete windows "
+            "before loss-aware WSqD considers a window stalled"
+        ),
+    )
+    parser.add_argument(
+        "--lr_plateau_drop_factor",
+        type=float,
+        default=0.80,
+        help="Multiplicative downward LR adjustment after a confirmed plateau",
+    )
+    parser.add_argument(
+        "--lr_plateau_patience",
+        type=int,
+        default=2,
+        help="Consecutive stalled windows required before a downward LR adjustment",
+    )
+    parser.add_argument(
+        "--lr_plateau_cooldown",
+        type=int,
+        default=1,
+        help="Complete loss windows ignored after each downward LR adjustment",
+    )
+    parser.add_argument(
+        "--lr_plateau_min_multiplier",
+        type=float,
+        default=0.25,
+        help="Lowest cumulative multiplier applied to the WSqD base before warmdown",
+    )
 
     parser.add_argument("--val_loss_every", type=int, default=128)
     parser.add_argument("--val_batch_size", type=int, default=16)
@@ -189,3 +234,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("lr_search_end cannot be negative")
     if args.lr_velocity_window < 8:
         raise ValueError("lr_velocity_window must be at least 8")
+    if args.lr_wsqd_shift < 0:
+        raise ValueError("lr_wsqd_shift cannot be negative")
+    if args.lr_plateau_min_improvement < 0:
+        raise ValueError("lr_plateau_min_improvement cannot be negative")
+    if not 0 < args.lr_plateau_drop_factor < 1:
+        raise ValueError("lr_plateau_drop_factor must be in (0, 1)")
+    if args.lr_plateau_patience < 1:
+        raise ValueError("lr_plateau_patience must be at least 1")
+    if args.lr_plateau_cooldown < 0:
+        raise ValueError("lr_plateau_cooldown cannot be negative")
+    if not 0 < args.lr_plateau_min_multiplier <= 1:
+        raise ValueError("lr_plateau_min_multiplier must be in (0, 1]")

@@ -1,92 +1,122 @@
-# Loss-velocity WSD
+# Monotonic WSqD schedulers
 
-## Why this controller exists
+The completed 1,536-step GQA4 and Micro-MoE probes showed the same failure mode:
+the forward-only `loss-velocity-wsd` controller accepted higher learning rates
+late, while most visible loss improvement arrived during the short final
+cooldown.
 
-The original trainer already uses Warmup–Stable–Decay (WSD): linear warmup,
-a long high-LR stable phase, and a terminal linear cooldown. WSD is a strong fit
-for NoCap because the target is final pretraining loss under a fixed token/time
-budget, and intermediate stable-phase loss can remain artificially elevated
-until cooldown.
+That controller is retained for reproducibility. It is not a faithful AdaLRS
+implementation: AdaLRS (arXiv:2506.13274) snapshots and backtracks model and
+optimizer state around LR trials, and its ablation reports that removing
+backtracking can leave lasting damage after an oversized trial. Hidden snapshot
+cost, repeated tokens, and timing ambiguity are poor fits for this speedrun.
 
-A normal `ReduceLROnPlateau` rule is a poor match. It can mistake expected WSD
-stable-phase behavior or a difficult FineWeb region for convergence and decay too
-early. The controller in this repository instead adapts the stable **peak LR**
-from training-loss descent velocity, then leaves the final decay deterministic.
+## `wsqd`
 
-## Algorithm
-
-`loss-velocity-wsd` overlays a bounded online LR search on WSD:
-
-1. Warm up linearly to the configured initial peak LR.
-2. During `lr_search_start <= step < lr_search_end`, collect training losses in
-   fixed windows.
-3. Winsorize rare batch spikes, smooth loss, fit `log(loss)` against step by
-   least squares, and use the negative slope as relative descent velocity.
-4. If velocity falls sufficiently below its EMA, try a mildly higher peak LR.
-5. Keep the higher LR only when the next window improves velocity beyond an
-   acceptance margin without raising representative loss.
-6. A failed higher-LR trial searches slightly below the previous peak.
-7. Shrink adjustment magnitudes after every decision.
-8. Freeze the selected peak after the search interval and perform a normal
-   terminal linear WSD decay.
-
-The implementation is inspired by AdaLRS (arXiv:2506.13274), including online
-loss-slope monitoring, early-only search, up-trials, downscaling after failed
-trials, and shrinking adjustment factors. It is intentionally more conservative
-and does **not** reproduce AdaLRS model/optimizer backtracking. Backtracking would
-create large hidden snapshot costs and ambiguous repeated-token accounting in a
-speedrun. Therefore, this variant should be evaluated as its own algorithm.
-
-## Recommended NoCap settings
-
-For Dense512 and LiquidLite on RTX 3090/V100:
+`wsqd` implements a shifted inverse-square-root base followed by a guaranteed
+linear cooldown, inspired by WSqD (arXiv:2607.10959):
 
 ```text
-initial peak LR:       0.0018
-search range:          0.00135 .. 0.00220
-search steps:          256 .. 3071
-velocity window:       128 optimizer steps
-upscale factor:        1.08
-downscale factor:      1.05
-factor decay:          0.90
-velocity trigger:      12%
-trial acceptance:      3%
-loss-rise guard:       6%
-terminal decay:        512 steps (candidate)
+linear warmup
+    ↓
+shifted inverse-square-root base
+    ↓
+reserved final linear cooldown
 ```
 
-The 512-step decay is approximately 10.7% of a 4,768-step run. MiniCPM's WSD
-experiments reported that roughly 10% decay was sufficient in their setting,
-but this must be validated on NoCap rather than assumed.
+After warmup:
 
-## Experiment order
+```text
+base_lr = peak_lr × sqrt((T0 + 1) / (T0 + post_warmup_step))
+```
 
-1. `dense512` fixed WSD, 1,024-step decay.
-2. `dense512` loss-velocity WSD, **same 1,024-step decay**.
-3. `dense512` loss-velocity WSD, 512-step decay.
-4. Repeat the winning scheduler on `baseline` for fairness.
-5. Only then combine it with `liquidlite512`.
+The first base step equals the configured peak. The base rate then decreases
+continuously; there is no flat high-LR middle phase. Power Scheduler
+(arXiv:2408.13359) independently finds an approximately inverse-square-root
+relationship between useful LR and token horizon.
 
-The 1,536-step probe is useful for stability and LR-decision inspection, but it
-cannot prove that a terminal schedule reaches the challenge target.
+## `loss-aware-wsqd`
+
+This experimental overlay uses **training loss only** and can only lower LR:
+
+```text
+effective_lr = wsqd_base_lr × monotonic_multiplier
+```
+
+For every complete robust loss window it:
+
+1. clips rare batch-loss spikes;
+2. smooths loss and fits log-loss velocity;
+3. compares median loss with the preceding window;
+4. requires both low median improvement and weak velocity;
+5. requires multiple consecutive stalled windows;
+6. multiplies LR downward;
+7. waits through a cooldown before another decision.
+
+The multiplier begins at `1.0`, is bounded below, and never increases.
+Validation loss never controls LR.
+
+The supplied probes use:
+
+```text
+window:                     128 steps
+minimum median improvement: 2.25%
+confirmation:               2 windows
+downward factor:            0.80
+cooldown:                   2 windows
+minimum multiplier:         0.40
+final cooldown:             about 20% of the probe
+```
+
+A replay of the uploaded GQA-like loss trend produces a downward decision and
+cannot increase LR. This validates controller direction, not counterfactual
+model quality; only a new GPU run can establish final loss.
+
+## 1,536-step tests
+
+Paper-backed WSqD controls:
+
+```bash
+bash scripts/run_wsqd_probe_3090.sh liquidlite512-gqa4 1536
+bash scripts/run_wsqd_probe_3090.sh liquidlite512-moe 1536
+```
+
+Loss-aware variants:
+
+```bash
+bash scripts/run_loss_aware_wsqd_probe_3090.sh liquidlite512-gqa4 1536
+bash scripts/run_loss_aware_wsqd_probe_3090.sh liquidlite512-moe 1536
+```
+
+Launchers forward extra arguments, for example:
+
+```bash
+bash scripts/run_loss_aware_wsqd_probe_3090.sh liquidlite512-moe 1536 \
+  --learning_rate 0.00155
+```
+
+## Full runs
+
+```bash
+bash scripts/run_wsqd_3090.sh liquidlite512-gqa4
+bash scripts/run_loss_aware_wsqd_3090.sh liquidlite512-gqa4
+```
+
+Equivalent V100 FP16 launchers are included.
 
 ## TUI and logs
 
-The LR panel displays:
+The TUI reports current LR, WSqD base LR, monotonic multiplier, loss-window
+improvement, velocity, plateau streak, decisions, and the latest LR event.
 
-- controller and phase (`warmup`, `lr-search`, `lr-trial`, `stable`, `warmdown`);
-- current and selected peak LR;
-- loss-window progress;
-- latest robust velocity and velocity EMA;
-- accepted/rejected decision counts and latest event.
+Training events add:
 
-Every training row also records `lr_schedule`, `lr_phase`,
-`peak_learning_rate`, and `loss_velocity`. Every LR decision is a separate
-`lr_scheduler` event in `events.jsonl`.
+```text
+base_learning_rate
+lr_multiplier
+loss_window_improvement
+```
 
-## Resume behavior
-
-Exact resume reconstructs adaptive state by replaying logged training losses up
-to the checkpoint's `next_step`. Scheduler arguments are checked strictly.
-Context-length switches reset slope history and cancel incomplete trials. Old
-format-2 checkpoints remain compatible with default fixed WSD.
+Exact adaptive resume reconstructs state by replaying `events.jsonl`. All new
+scheduler arguments are checked strictly. Pure `wsqd` is deterministic and
+does not need loss replay.
