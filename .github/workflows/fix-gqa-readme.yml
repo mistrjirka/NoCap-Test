@@ -1,0 +1,68 @@
+name: Finalize GQA4 documentation
+
+on:
+  push:
+    branches:
+      - agent/liquidlite-gqa4
+    paths:
+      - .github/workflows/fix-gqa-readme.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/liquidlite-gqa4
+          fetch-depth: 0
+      - name: Clarify target-GPU validation status
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('README.md')
+          text = path.read_text(encoding='utf-8')
+          old = '''The tests check parameter counts, tied-weight initialization, finite
+          forward/backward passes, strict convolution causality, TTY zoom logic, atomic
+          checkpoint publication, data-stream continuity, RNG restoration, AdamW
+          continuation, GQA parameter counts, CPU fallback, strict causality, and the
+          native CUDA GQA forward/backward path.
+          '''
+          new = '''The CPU tests check parameter counts, tied-weight initialization, finite
+          forward/backward passes, strict convolution causality, TTY zoom logic, atomic
+          checkpoint publication, data-stream continuity, RNG restoration, AdamW
+          continuation, GQA parameter counts, CPU fallback, and strict causality.
+          `gqa_cuda_smoke.py` separately checks the native CUDA path on the target GPU.
+          '''
+          if old not in text:
+              raise SystemExit('Expected test paragraph was not found')
+          text = text.replace(old, new)
+          old = '''- PyTorch GQA is experimental and may choose different attention backends across
+          RTX 3090 and V100; CUDA convergence and speed must be measured on both targets.
+          - CUDA convergence and speed must be measured on the target machines; this
+          packaging environment has no NVIDIA GPU.
+          '''
+          new = '''- PyTorch GQA is experimental and may choose different attention backends across
+          RTX 3090 and V100. CUDA convergence and speed must be measured on the target
+          machines; this packaging environment has no NVIDIA GPU.
+          '''
+          if old not in text:
+              raise SystemExit('Expected limitations paragraph was not found')
+          path.write_text(text.replace(old, new), encoding='utf-8')
+          PY
+          rm .github/workflows/fix-gqa-readme.yml
+      - name: Commit documentation cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Clarify GQA target-GPU validation'
+          git push origin HEAD:agent/liquidlite-gqa4
