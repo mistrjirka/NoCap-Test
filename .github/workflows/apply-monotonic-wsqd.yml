@@ -1,12 +1,6 @@
-name: Apply monotonic WSqD implementation
+name: Diagnose monotonic WSqD payload
 
 on:
-  push:
-    branches:
-      - agent/monotonic-wsqd
-    paths:
-      - .scheduler-upload/**
-      - .github/workflows/apply-monotonic-wsqd.yml
   pull_request:
     branches:
       - master
@@ -15,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  apply:
+  diagnose:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
@@ -24,45 +18,35 @@ jobs:
           ref: agent/monotonic-wsqd
           fetch-depth: 0
 
-      - name: Extract staged source
+      - name: Record payload diagnostics
         shell: bash
         run: |
-          set -euo pipefail
-          test "$(find .scheduler-upload -maxdepth 1 -name 'part-*' | wc -l)" -eq 7
-          cat .scheduler-upload/part-* | base64 --decode > /tmp/monotonic-wsqd.tar.gz
-          sha256sum .scheduler-upload/part-* /tmp/monotonic-wsqd.tar.gz
-          tar -tzf /tmp/monotonic-wsqd.tar.gz
-          tar -xzf /tmp/monotonic-wsqd.tar.gz
-
-      - name: Validate scheduler implementation
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install --quiet rich
-          python -m py_compile \
-            training/lr_scheduler.py \
-            training/cli.py \
-            training/display.py \
-            training/loop.py \
-            scheduler_test.py
-          python scheduler_test.py
-          bash -n \
-            scripts/run_wsqd_probe_3090.sh \
-            scripts/run_loss_aware_wsqd_probe_3090.sh \
-            scripts/run_wsqd_3090.sh \
-            scripts/run_loss_aware_wsqd_3090.sh \
-            scripts/run_wsqd_probe_v100.sh \
-            scripts/run_loss_aware_wsqd_probe_v100.sh \
-            scripts/run_wsqd_v100.sh \
-            scripts/run_loss_aware_wsqd_v100.sh
-
-      - name: Commit implementation
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf .scheduler-upload .patch-upload .github/workflows/apply-monotonic-wsqd.yml
+          set +e
+          diagnostics=.scheduler-upload/diagnostics.txt
+          {
+            echo 'files:'
+            find .scheduler-upload -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+            echo
+            echo 'hashes:'
+            sha256sum .scheduler-upload/part-* 2>&1
+          } > "$diagnostics"
+          cat .scheduler-upload/part-* | base64 --decode > /tmp/monotonic-wsqd.tar.gz 2>> "$diagnostics"
+          decode_rc=$?
+          {
+            echo
+            echo "base64_decode_rc=$decode_rc"
+            if [ -f /tmp/monotonic-wsqd.tar.gz ]; then
+              sha256sum /tmp/monotonic-wsqd.tar.gz
+              gzip -t /tmp/monotonic-wsqd.tar.gz
+              echo "gzip_test_rc=$?"
+              tar -tzf /tmp/monotonic-wsqd.tar.gz
+              echo "tar_list_rc=$?"
+            fi
+          } >> "$diagnostics" 2>&1
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
-          git commit -m 'Add monotonic WSqD schedulers'
+          git add "$diagnostics"
+          git commit -m 'Record WSqD payload diagnostics' || true
           git push origin HEAD:agent/monotonic-wsqd
+          test "$decode_rc" -eq 0
+          gzip -t /tmp/monotonic-wsqd.tar.gz
